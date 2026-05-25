@@ -171,12 +171,52 @@ static void test_pdo_selection(void) {
     CHECK_EQ(pd_select_fixed_pdo(mixed, 2, 20000, &chosen), 0);
 }
 
+static void test_real_charger_pdo_sets(void) {
+    PdPdo chosen;
+
+    /* Typical 65 W USB-C GaN charger: 5/9/12/15/20 V Fixed + two PPS APDOs.
+     * (20 V is 3.25 A on a 65 W supply.) The PPS objects must be ignored by the
+     * Fixed-PDO selector. */
+    const uint32_t gan65[] = {
+        0x0001912Cu, /* 5V  / 3A    */
+        0x0002D12Cu, /* 9V  / 3A    */
+        0x0003C12Cu, /* 12V / 3A    */
+        0x0004B12Cu, /* 15V / 3A    */
+        0x00064145u, /* 20V / 3.25A */
+        (3u << 30) | (110u << 17) | (33u << 8) | 60u, /* PPS 3.3-11V / 3A  */
+        (3u << 30) | (210u << 17) | (33u << 8) | 100u, /* PPS 3.3-21V / 5A */
+    };
+    const size_t n = sizeof(gan65) / sizeof(gan65[0]);
+
+    CHECK_EQ(pd_select_fixed_pdo(gan65, n, 9000, &chosen), 2);
+    CHECK_EQ(chosen.voltage_mv, 9000);
+    CHECK_EQ(pd_select_fixed_pdo(gan65, n, 12000, &chosen), 3);
+    CHECK_EQ(chosen.voltage_mv, 12000);
+    CHECK_EQ(pd_select_fixed_pdo(gan65, n, 20000, &chosen), 5);
+    CHECK_EQ(chosen.voltage_mv, 20000);
+    CHECK_EQ(chosen.max_current_ma, 3250);
+    /* Far above any offer: still the highest Fixed supply (20V). */
+    CHECK_EQ(pd_select_fixed_pdo(gan65, n, 60000, &chosen), 5);
+
+    /* Apple 20 W: 5V/3A + 9V/2.22A. */
+    const uint32_t apple20[] = {0x0001912Cu, 0x0002D0DEu};
+    CHECK_EQ(pd_select_fixed_pdo(apple20, 2, 9000, &chosen), 2);
+    CHECK_EQ(chosen.voltage_mv, 9000);
+    CHECK_EQ(chosen.max_current_ma, 2220);
+
+    /* 5 V-only brick: nothing above 5 V, so 5 V wins; below 5 V, nothing. */
+    const uint32_t brick[] = {0x0001912Cu};
+    CHECK_EQ(pd_select_fixed_pdo(brick, 1, 20000, &chosen), 1);
+    CHECK_EQ(pd_select_fixed_pdo(brick, 1, 4500, &chosen), 0);
+}
+
 int main(void) {
     test_header_roundtrip();
     test_fixed_pdo_decode();
     test_other_pdo_decode();
     test_rdo_build();
     test_pdo_selection();
+    test_real_charger_pdo_sets();
 
     if(g_failures == 0) {
         printf("All PD protocol tests passed.\n");

@@ -18,3 +18,20 @@ cc -Wall -Wextra -I../applications/services/pd \
 ```
 
 Expected output: `All PD protocol tests passed.`
+
+## USB-PD sink policy (`pd_sink_policy_test.c`)
+
+Simulates the sink negotiation state machine in
+`applications/services/pd/pd_sink_policy.c` end-to-end with no hardware: a full
+`Source_Capabilities` → `Request` → `Accept` → `PS_RDY` handshake, plus
+soft-reset, capability-mismatch fallback, Reject/Wait, detach, hard reset, and
+out-of-order message handling.
+
+```sh
+cc -Wall -Wextra -I../applications/services/pd pd_sink_policy_test.c \
+   ../applications/services/pd/pd_sink_policy.c \
+   ../applications/services/pd/pd_protocol.c -o pd_sink_policy_test
+./pd_sink_policy_test
+```
+
+Expected output: `All PD sink policy tests passed.`

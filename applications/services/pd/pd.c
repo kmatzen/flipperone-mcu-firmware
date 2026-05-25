@@ -1,5 +1,6 @@
 #include "pd.h"
 #include "pd_protocol.h"
+#include "pd_sink_policy.h"
 
 #include <furi.h>
 #include <api_lock.h>
@@ -13,8 +14,6 @@
 #define PD_MAX_MESSAGES (8)
 /** Safety ceiling for negotiated voltage. Must not exceed the board VBUS rating. */
 #define PD_SINK_DEFAULT_MAX_VOLTAGE_MV (9000)
-/** Sink input current limit (matches the BQ25792 input current limit). */
-#define PD_SINK_MAX_CURRENT_MA (3000)
 /** Upper bound on PD messages drained per interrupt to bound loop time. */
 #define PD_RX_DRAIN_LIMIT (8)
 /** USB-PD revision used for headers and the chip's auto GoodCRC role bits. */
@@ -25,16 +24,6 @@ typedef enum {
     PdLoopFlagAll = (PdLoopFlagIsr),
 } PdLoopFlag;
 
-/** Sink policy engine state. */
-typedef enum {
-    PdSinkStateIdle, //!< PD disabled
-    PdSinkStateWaitVbus, //!< armed, waiting for a source to apply VBUS
-    PdSinkStateWaitCaps, //!< configured, waiting for Source_Capabilities
-    PdSinkStateRequested, //!< Request sent, waiting for Accept
-    PdSinkStateWaitPsRdy, //!< Accept received, waiting for PS_RDY
-    PdSinkStateReady, //!< power contract in effect
-} PdSinkState;
-
 struct Pd {
     FuriEventLoop* event_loop;
     FuriPubSub* event_pubsub;
@@ -42,21 +31,7 @@ struct Pd {
     PdMode mode;
     FuriMessageQueue* message_queue;
     PdDevice device;
-
-    // sink policy engine
-    PdSinkState sink_state;
-    Fusb302TypeCcOrientation orientation;
-    uint8_t tx_msg_id;
-    uint16_t max_voltage_mv;
-
-    // selection pending acceptance
-    uint8_t selected_position;
-    uint16_t selected_voltage_mv;
-    uint16_t selected_current_ma;
-
-    // active contract
-    uint16_t contract_voltage_mv;
-    uint16_t contract_current_ma;
+    PdSinkPolicy policy;
 };
 
 typedef enum {
@@ -83,7 +58,7 @@ typedef struct {
 } PdMessage;
 
 /* ------------------------------------------------------------------ */
-/* Event publishing                                                    */
+/* Action execution: turn policy decisions into hardware I/O / events  */
 /* ------------------------------------------------------------------ */
 
 static void pd_publish(Pd* instance, PdEventType type, uint16_t voltage_mv, uint16_t current_ma) {
@@ -95,148 +70,62 @@ static void pd_publish(Pd* instance, PdEventType type, uint16_t voltage_mv, uint
     furi_pubsub_publish(instance->event_pubsub, &event);
 }
 
-/* ------------------------------------------------------------------ */
-/* Sink message transmission                                           */
-/* ------------------------------------------------------------------ */
+static void pd_execute_action(Pd* instance, const PdSinkAction* action) {
+    if(action->send) {
+        PdHeader header = {
+            .message_type = action->tx_message_type,
+            .data_role = PdDataRoleUfp,
+            .spec_rev = PdSpecRev20,
+            .power_role = PdPowerRoleSink,
+            .message_id = action->tx_message_id,
+            .num_objects = action->tx_object_count,
+            .extended = false,
+        };
 
-static void
-    pd_sink_send(Pd* instance, uint8_t message_type, const uint32_t* objects, uint8_t count) {
-    PdHeader header = {
-        .message_type = message_type,
-        .data_role = PdDataRoleUfp,
-        .spec_rev = PdSpecRev20,
-        .power_role = PdPowerRoleSink,
-        .message_id = instance->tx_msg_id,
-        .num_objects = count,
-        .extended = false,
-    };
-
-    Fusb302PdMsg msg = {0};
-    msg.sop_type = Fusb302PdSopTypeDefault;
-    msg.header = pd_header_build(&header);
-    msg.object_count = count;
-    for(uint8_t i = 0; i < count; i++) {
-        msg.objects[i] = objects[i];
-    }
-
-    if(fusb302_pd_message_send(instance->fusb302_header, &msg) == Fusb302StatusOk) {
-        instance->tx_msg_id = (instance->tx_msg_id + 1) & 0x07;
-    } else {
-        FURI_LOG_E(TAG, "Failed to send PD message type %u", message_type);
-    }
-}
-
-static void pd_sink_send_control(Pd* instance, uint8_t control_type) {
-    pd_sink_send(instance, control_type, NULL, 0);
-}
-
-static void pd_sink_send_sink_caps(Pd* instance) {
-    /* Advertise a single vSafe5V Fixed PDO sized to our input current limit. */
-    uint32_t pdo = pd_pdo_build_fixed(5000, PD_SINK_MAX_CURRENT_MA);
-    pd_sink_send(instance, PdDataSinkCapabilities, &pdo, 1);
-}
-
-/* ------------------------------------------------------------------ */
-/* Sink policy                                                         */
-/* ------------------------------------------------------------------ */
-
-static void pd_sink_handle_source_caps(Pd* instance, const Fusb302PdMsg* msg) {
-    PdPdo chosen;
-    uint8_t position =
-        pd_select_fixed_pdo(msg->objects, msg->object_count, instance->max_voltage_mv, &chosen);
-
-    uint32_t rdo;
-    if(position == 0) {
-        /* Nothing within our voltage ceiling: fall back to PDO #1 (always
-         * vSafe5V) and flag a capability mismatch so the source knows. */
-        PdPdo first;
-        pd_pdo_parse(msg->objects[0], &first);
-        uint16_t current = first.max_current_ma ? first.max_current_ma : 500;
-        rdo = pd_rdo_build_fixed(1, current, current, true, true);
-        instance->selected_position = 1;
-        instance->selected_voltage_mv = first.voltage_mv;
-        instance->selected_current_ma = current;
-        FURI_LOG_W(
-            TAG, "No PDO within %u mV; requesting 5V with mismatch", instance->max_voltage_mv);
-    } else {
-        uint16_t current = chosen.max_current_ma;
-        if(current > PD_SINK_MAX_CURRENT_MA) {
-            current = PD_SINK_MAX_CURRENT_MA;
+        Fusb302PdMsg msg = {0};
+        msg.sop_type = Fusb302PdSopTypeDefault;
+        msg.header = pd_header_build(&header);
+        msg.object_count = action->tx_object_count;
+        for(uint8_t i = 0; i < action->tx_object_count; i++) {
+            msg.objects[i] = action->tx_objects[i];
         }
-        rdo = pd_rdo_build_fixed(position, current, current, false, true);
-        instance->selected_position = position;
-        instance->selected_voltage_mv = chosen.voltage_mv;
-        instance->selected_current_ma = current;
+
+        if(fusb302_pd_message_send(instance->fusb302_header, &msg) != Fusb302StatusOk) {
+            FURI_LOG_E(TAG, "Failed to send PD message type %u", action->tx_message_type);
+        }
+    }
+
+    switch(action->outcome) {
+    case PdSinkOutcomeAttached:
+        pd_publish(instance, PdEventTypeSourceAttached, 0, 0);
+        break;
+    case PdSinkOutcomeContract:
         FURI_LOG_I(
-            TAG, "Selected PDO #%u: %u mV %u mA", position, chosen.voltage_mv, current);
-    }
-
-    pd_sink_send(instance, PdDataRequest, &rdo, 1);
-    instance->sink_state = PdSinkStateRequested;
-}
-
-static void pd_sink_dispatch(Pd* instance, const Fusb302PdMsg* msg) {
-    /* Only Source/Sink SOP traffic is relevant to the port partner contract. */
-    if(msg->sop_type != Fusb302PdSopTypeDefault) {
-        return;
-    }
-
-    PdHeader header;
-    pd_header_parse(msg->header, &header);
-
-    if(pd_header_is_control(msg->header)) {
-        switch(header.message_type) {
-        case PdControlAccept:
-            if(instance->sink_state == PdSinkStateRequested) {
-                instance->sink_state = PdSinkStateWaitPsRdy;
-            }
-            break;
-        case PdControlPsRdy:
-            if(instance->sink_state == PdSinkStateWaitPsRdy) {
-                instance->sink_state = PdSinkStateReady;
-                instance->contract_voltage_mv = instance->selected_voltage_mv;
-                instance->contract_current_ma = instance->selected_current_ma;
-                FURI_LOG_I(
-                    TAG,
-                    "PD contract: %u mV %u mA",
-                    instance->contract_voltage_mv,
-                    instance->contract_current_ma);
-                pd_publish(
-                    instance,
-                    PdEventTypeContract,
-                    instance->contract_voltage_mv,
-                    instance->contract_current_ma);
-            }
-            break;
-        case PdControlReject:
-        case PdControlWait:
-            FURI_LOG_W(
-                TAG,
-                "Request %s",
-                header.message_type == PdControlReject ? "rejected" : "deferred");
-            if(instance->sink_state == PdSinkStateRequested) {
-                /* Keep waiting; the source may resend its capabilities. */
-                instance->sink_state = PdSinkStateWaitCaps;
-            }
-            break;
-        case PdControlSoftReset:
-            /* Reset our MessageID counter and accept, per section 6.8.2. */
-            instance->tx_msg_id = 0;
-            pd_sink_send_control(instance, PdControlAccept);
-            instance->sink_state = PdSinkStateWaitCaps;
-            break;
-        case PdControlGetSinkCap:
-            pd_sink_send_sink_caps(instance);
-            break;
-        default:
-            break;
-        }
-    } else {
-        if(header.message_type == PdDataSourceCapabilities && msg->object_count > 0) {
-            pd_sink_handle_source_caps(instance, msg);
-        }
+            TAG,
+            "PD contract: %u mV %u mA",
+            action->contract_voltage_mv,
+            action->contract_current_ma);
+        pd_publish(
+            instance,
+            PdEventTypeContract,
+            action->contract_voltage_mv,
+            action->contract_current_ma);
+        break;
+    case PdSinkOutcomeDetached:
+        pd_publish(instance, PdEventTypeDetached, 0, 0);
+        break;
+    case PdSinkOutcomeFailed:
+        pd_publish(instance, PdEventTypeFailed, 0, 0);
+        break;
+    case PdSinkOutcomeNone:
+    default:
+        break;
     }
 }
+
+/* ------------------------------------------------------------------ */
+/* Hardware glue around the policy                                     */
+/* ------------------------------------------------------------------ */
 
 static void pd_sink_drain_rx(Pd* instance) {
     for(uint8_t i = 0; i < PD_RX_DRAIN_LIMIT; i++) {
@@ -249,7 +138,14 @@ static void pd_sink_drain_rx(Pd* instance) {
             FURI_LOG_W(TAG, "PD receive error");
             break;
         }
-        pd_sink_dispatch(instance, &msg);
+        /* Only the port-partner (SOP) contract is handled here. */
+        if(msg.sop_type != Fusb302PdSopTypeDefault) {
+            continue;
+        }
+        PdSinkAction action;
+        pd_sink_policy_handle_message(
+            &instance->policy, msg.header, msg.objects, msg.object_count, &action);
+        pd_execute_action(instance, &action);
     }
 }
 
@@ -259,36 +155,27 @@ static void pd_sink_on_attach(Pd* instance) {
         return;
     }
     if(orientation == Fusb302TypeCcOrientationNone) {
-        instance->sink_state = PdSinkStateWaitVbus;
         return;
     }
-
-    instance->orientation = orientation;
-    instance->tx_msg_id = 0;
     if(fusb302_pd_sink_start(instance->fusb302_header, orientation, PD_SPEC_REV) !=
        Fusb302StatusOk) {
         return;
     }
-    instance->sink_state = PdSinkStateWaitCaps;
     FURI_LOG_I(
-        TAG,
-        "Source attached on CC%d",
-        orientation == Fusb302TypeCcOrientationNormal ? 1 : 2);
-    pd_publish(instance, PdEventTypeSourceAttached, 0, 0);
+        TAG, "Source attached on CC%d", orientation == Fusb302TypeCcOrientationNormal ? 1 : 2);
+
+    PdSinkAction action;
+    pd_sink_policy_attach(&instance->policy, &action);
+    pd_execute_action(instance, &action);
 }
 
 static void pd_sink_on_detach(Pd* instance) {
-    bool had_contract = (instance->sink_state == PdSinkStateReady);
-    instance->sink_state = PdSinkStateWaitVbus;
-    instance->tx_msg_id = 0;
-    instance->contract_voltage_mv = 0;
-    instance->contract_current_ma = 0;
+    PdSinkAction action;
+    pd_sink_policy_detach(&instance->policy, &action);
     /* Re-arm so the next attach raises VBUSOK again. */
     fusb302_sink_arm(instance->fusb302_header);
     FURI_LOG_I(TAG, "Source detached");
-    if(had_contract) {
-        pd_publish(instance, PdEventTypeDetached, 0, 0);
-    }
+    pd_execute_action(instance, &action);
 }
 
 static void pd_handle_isr(Pd* instance) {
@@ -299,24 +186,20 @@ static void pd_handle_isr(Pd* instance) {
 
     if(irq.hard_reset) {
         FURI_LOG_W(TAG, "PD hard reset received");
-        bool had_contract = (instance->sink_state == PdSinkStateReady);
-        instance->tx_msg_id = 0;
-        instance->contract_voltage_mv = 0;
-        instance->contract_current_ma = 0;
-        instance->sink_state = PdSinkStateWaitCaps;
-        if(had_contract) {
-            pd_publish(instance, PdEventTypeFailed, 0, 0);
-        }
+        PdSinkAction action;
+        pd_sink_policy_hard_reset(&instance->policy, &action);
+        pd_execute_action(instance, &action);
     }
 
     if(irq.vbus_ok) {
         bool vbus = false;
         fusb302_get_vbus_ok(instance->fusb302_header, &vbus);
         if(vbus) {
-            if(instance->sink_state == PdSinkStateWaitVbus) {
+            if(instance->mode == PdModeSnk &&
+               pd_sink_policy_state(&instance->policy) == PdSinkStateIdle) {
                 pd_sink_on_attach(instance);
             }
-        } else {
+        } else if(instance->mode == PdModeSnk) {
             pd_sink_on_detach(instance);
         }
     }
@@ -334,20 +217,15 @@ static bool pd_apply_mode(Pd* instance, PdMode mode) {
     switch(mode) {
     case PdModeOff:
         fusb302_pd_disable(instance->fusb302_header);
-        instance->sink_state = PdSinkStateIdle;
-        instance->contract_voltage_mv = 0;
-        instance->contract_current_ma = 0;
+        pd_sink_policy_reset(&instance->policy);
         instance->mode = mode;
         return true;
     case PdModeSnk: {
         instance->mode = mode;
-        instance->tx_msg_id = 0;
-        instance->contract_voltage_mv = 0;
-        instance->contract_current_ma = 0;
+        pd_sink_policy_reset(&instance->policy);
         if(fusb302_sink_arm(instance->fusb302_header) != Fusb302StatusOk) {
             return false;
         }
-        instance->sink_state = PdSinkStateWaitVbus;
         /* If a source is already attached, begin negotiating immediately. */
         bool vbus = false;
         fusb302_get_vbus_ok(instance->fusb302_header, &vbus);
@@ -393,28 +271,16 @@ static void pd_message_queue_callback(FuriEventLoopObject* object, void* context
         break;
     case PdMessageTypeResetConfig:
         result = fusb302_sw_reset(instance->fusb302_header) == Fusb302StatusOk;
-        instance->sink_state = PdSinkStateIdle;
-        instance->contract_voltage_mv = 0;
-        instance->contract_current_ma = 0;
+        pd_sink_policy_reset(&instance->policy);
         break;
     case PdMessageTypeSetMaxVoltage:
-        instance->max_voltage_mv = msg.set_max_voltage;
+        pd_sink_policy_set_max_voltage(&instance->policy, msg.set_max_voltage);
         result = true;
         break;
-    case PdMessageTypeGetContract: {
-        bool active =
-            (instance->sink_state == PdSinkStateReady) && (instance->contract_voltage_mv > 0);
-        if(active) {
-            if(msg.get_contract.voltage_mv) {
-                *msg.get_contract.voltage_mv = instance->contract_voltage_mv;
-            }
-            if(msg.get_contract.current_ma) {
-                *msg.get_contract.current_ma = instance->contract_current_ma;
-            }
-        }
-        result = active;
+    case PdMessageTypeGetContract:
+        result = pd_sink_policy_contract(
+            &instance->policy, msg.get_contract.voltage_mv, msg.get_contract.current_ma);
         break;
-    }
     default:
         furi_crash("Invalid message type");
         break;
@@ -455,15 +321,7 @@ static Pd* pd_alloc(void) {
     instance->fusb302_header = fusb302_init(&furi_hal_i2c_handle_main, FUSB302_ADDRESS, NULL);
     instance->mode = PdModeOff;
     instance->device = 0;
-    instance->sink_state = PdSinkStateIdle;
-    instance->orientation = Fusb302TypeCcOrientationNone;
-    instance->tx_msg_id = 0;
-    instance->max_voltage_mv = PD_SINK_DEFAULT_MAX_VOLTAGE_MV;
-    instance->selected_position = 0;
-    instance->selected_voltage_mv = 0;
-    instance->selected_current_ma = 0;
-    instance->contract_voltage_mv = 0;
-    instance->contract_current_ma = 0;
+    pd_sink_policy_init(&instance->policy, PD_SINK_DEFAULT_MAX_VOLTAGE_MV);
 
     if(instance->fusb302_header) {
         instance->device |= PdDeviceFusb302;
