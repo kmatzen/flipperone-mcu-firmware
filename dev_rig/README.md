@@ -14,7 +14,8 @@ integration — that's board-level (see `../applications/services/pd/TESTING.md`
 ## Bill of materials
 - Raspberry Pi Pico 2 (RP2350).
 - A FUSB302 breakout that brings out CC1/CC2 to a USB-C receptacle, plus VBUS,
-  INT, SDA, SCL, VDD, GND.
+  INT, SDA, SCL, VDD, GND. Ready-made ones are often out of stock — see
+  [`ORDERING.md`](ORDERING.md) for the recommended board and how to fab it.
 - A multi-PDO USB-C PD charger (offers 9V/12V/… , ideally PPS).
 - A full-featured (CC-passthrough) USB-C ↔ C cable.
 - Recommended: an inline USB-PD analyzer / USB-C V/A meter to confirm the actual
@@ -40,6 +41,21 @@ integration — that's board-level (see `../applications/services/pd/TESTING.md`
 
 Pins are configurable at the top of `main.c` (`I2C_*`) and the requested voltage
 ceiling via `SINK_MAX_VOLTAGE_MV`.
+
+### ReclaimerLabs USB-PD-Breakout (recommended board)
+This board is **FUSB302BMPX (I²C 0x22)** — the rig's default — and its CC1/CC2 and
+VBUS go to the on-board USB-C jack, so you only run four wires to its J4 header
+(and the charger plugs into the board's USB-C). No firmware change needed.
+
+| Pico 2 | ReclaimerLabs J4 | FUSB302 |
+|---|---|---|
+| GP4 (pin 6) | J4-7 (SDA) | SDA |
+| GP5 (pin 7) | J4-6 (SCL) | SCL |
+| 3V3 (OUT) | J4-3 (VDD) | VDD |
+| GND | J4-4 / J4-8 (GND) | GND |
+
+J4 also exposes `~INT` (J4-5); the rig polls, so leave it unconnected. See
+[`ORDERING.md`](ORDERING.md) to obtain the board.
 
 ## Build
 From the repo root, with an arm-none-eabi toolchain and a pico-sdk available:
