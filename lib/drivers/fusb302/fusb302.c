@@ -412,6 +412,309 @@ Fusb302Status fusb302_cc_orientation_set(Fusb302* instance, Fusb302TypeCcOrienta
     return res;
 }
 
+//////////////////////SINK//////////////////////
+Fusb302Status fusb302_read_interrupts(Fusb302* instance, Fusb302Interrupts* out) {
+    furi_check(instance);
+    furi_check(out);
+
+    Fusb302InterruptRegBits irq = {0};
+    Fusb302InterruptARegBits irq_a = {0};
+    Fusb302InterruptBRegBits irq_b = {0};
+    Fusb302Status res = Fusb302StatusUnknown;
+    do {
+        res = fusb302_read_reg(instance, Fusb302RegInterrupt, (uint8_t*)&irq);
+        if(res != Fusb302StatusOk) break;
+        res = fusb302_read_reg(instance, Fusb302RegInterruptA, (uint8_t*)&irq_a);
+        if(res != Fusb302StatusOk) break;
+        res = fusb302_read_reg(instance, Fusb302RegInterruptB, (uint8_t*)&irq_b);
+    } while(false);
+
+    if(res != Fusb302StatusOk) {
+        FURI_LOG_E(TAG, "Failed to read interrupts!");
+        return res;
+    }
+
+    out->vbus_ok = irq.i_vbusok;
+    out->comp_changed = irq.i_comp_chng;
+    out->bc_level = irq.i_bc_lvl;
+    out->collision = irq.i_collision;
+    out->crc_check = irq.i_crc_chk;
+    out->activity = irq.i_activity;
+    out->hard_reset = irq_a.i_hard_rst;
+    out->soft_reset = irq_a.i_soft_rst;
+    out->tx_sent = irq_a.i_tx_sent;
+    out->retry_fail = irq_a.i_retry_fail;
+    out->toggle_done = irq_a.i_tog_done;
+    out->good_crc_sent = irq_b.i_gcrc_sent;
+    return res;
+}
+
+Fusb302Status fusb302_get_vbus_ok(Fusb302* instance, bool* vbus_ok) {
+    furi_check(instance);
+    furi_check(vbus_ok);
+    Fusb302Status0RegBits status0 = {0};
+    Fusb302Status res = fusb302_read_reg(instance, Fusb302RegStatus0, (uint8_t*)&status0);
+    if(res == Fusb302StatusOk) {
+        *vbus_ok = status0.vbusok;
+    }
+    return res;
+}
+
+/** Measure the requested CC line and return its BC_LVL (0..3). */
+static Fusb302Status fusb302_measure_cc(Fusb302* instance, bool cc2, uint8_t* bc_lvl) {
+    Fusb302Switches0RegBits sw0 = {0};
+    Fusb302Status res = fusb302_read_reg(instance, Fusb302RegSwitches0, (uint8_t*)&sw0);
+    if(res != Fusb302StatusOk) return res;
+
+    sw0.pdwn1 = 1; // present Rd on both CC lines
+    sw0.pdwn2 = 1;
+    sw0.meas_cc1 = cc2 ? 0 : 1;
+    sw0.meas_cc2 = cc2 ? 1 : 0;
+    res = fusb302_write_reg(instance, Fusb302RegSwitches0, *(uint8_t*)&sw0);
+    if(res != Fusb302StatusOk) return res;
+
+    furi_delay_ms(1); // let the measure block settle before sampling
+
+    Fusb302Status0RegBits status0 = {0};
+    res = fusb302_read_reg(instance, Fusb302RegStatus0, (uint8_t*)&status0);
+    if(res == Fusb302StatusOk) {
+        *bc_lvl = status0.bc_lvl;
+    }
+    return res;
+}
+
+Fusb302Status
+    fusb302_detect_cc_orientation(Fusb302* instance, Fusb302TypeCcOrientation* orientation) {
+    furi_check(instance);
+    furi_check(orientation);
+    *orientation = Fusb302TypeCcOrientationNone;
+
+    // Power the bandgap, receiver and measure block so BC_LVL is valid.
+    Fusb302PowerRegBits power = {0};
+    power.pwr = 0b0111;
+    Fusb302Status res = fusb302_write_reg(instance, Fusb302RegPower, *(uint8_t*)&power);
+    if(res != Fusb302StatusOk) return res;
+
+    uint8_t cc1 = 0;
+    uint8_t cc2 = 0;
+    res = fusb302_measure_cc(instance, false, &cc1);
+    if(res != Fusb302StatusOk) return res;
+    res = fusb302_measure_cc(instance, true, &cc2);
+    if(res != Fusb302StatusOk) return res;
+
+    if(cc1 == 0 && cc2 == 0) {
+        *orientation = Fusb302TypeCcOrientationNone;
+    } else if(cc1 >= cc2) {
+        *orientation = Fusb302TypeCcOrientationNormal;
+    } else {
+        *orientation = Fusb302TypeCcOrientationReverse;
+    }
+    return res;
+}
+
+Fusb302Status fusb302_pd_sink_start(
+    Fusb302* instance,
+    Fusb302TypeCcOrientation orientation,
+    Fusb302SpecRev rev) {
+    furi_check(instance);
+    furi_check(
+        orientation == Fusb302TypeCcOrientationNormal ||
+        orientation == Fusb302TypeCcOrientationReverse);
+    const bool normal = (orientation == Fusb302TypeCcOrientationNormal);
+
+    Fusb302Status res = Fusb302StatusUnknown;
+    do {
+        // 1. Power up every block; PWR[3] (internal oscillator) is required for TX.
+        Fusb302PowerRegBits power = {0};
+        power.pwr = 0b1111;
+        res = fusb302_write_reg(instance, Fusb302RegPower, *(uint8_t*)&power);
+        if(res != Fusb302StatusOk) break;
+
+        // 2. Present Rd on both CC lines, measure the active CC, no VCONN / pull-ups.
+        Fusb302Switches0RegBits sw0 = {0};
+        sw0.pdwn1 = 1;
+        sw0.pdwn2 = 1;
+        sw0.meas_cc1 = normal ? 1 : 0;
+        sw0.meas_cc2 = normal ? 0 : 1;
+        res = fusb302_write_reg(instance, Fusb302RegSwitches0, *(uint8_t*)&sw0);
+        if(res != Fusb302StatusOk) break;
+
+        // 3. Route the BMC transmitter to the active CC and program the role bits
+        //    used to build the auto GoodCRC reply (sink / UFP / spec rev).
+        Fusb302Switches1RegBits sw1 = {0};
+        sw1.tx_cc1 = normal ? 1 : 0;
+        sw1.tx_cc2 = normal ? 0 : 1;
+        sw1.auto_crc = 1;
+        sw1.data_role = 0; // UFP
+        sw1.power_role = 0; // Sink
+        sw1.spec_rev = (uint8_t)(rev & 0b11);
+        res = fusb302_write_reg(instance, Fusb302RegSwitches1, *(uint8_t*)&sw1);
+        if(res != Fusb302StatusOk) break;
+
+        // 4. Auto-retry a packet up to three times if no GoodCRC comes back.
+        Fusb302Control3RegBits control3 = {0};
+        res = fusb302_read_reg(instance, Fusb302RegControl3, (uint8_t*)&control3);
+        if(res != Fusb302StatusOk) break;
+        control3.auto_retry = 1;
+        control3.n_retries = 3;
+        res = fusb302_write_reg(instance, Fusb302RegControl3, *(uint8_t*)&control3);
+        if(res != Fusb302StatusOk) break;
+
+        // 5. Interrupt masks (1 = masked). Keep VBUSOK, hard/soft reset, TX sent,
+        //    retry fail and GoodCRC-sent; silence the rest.
+        Fusb302MaskRegBits mask = {0};
+        mask.m_bc_lvl = 1;
+        mask.m_collision = 1;
+        mask.m_wake = 1;
+        mask.m_alert = 1;
+        mask.m_crc_chk = 1; // GoodCRC-sent (MaskB) is used instead
+        mask.m_comp_chng = 1;
+        mask.m_activity = 1;
+        mask.m_vbusok = 0;
+        res = fusb302_write_reg(instance, Fusb302RegMask, *(uint8_t*)&mask);
+        if(res != Fusb302StatusOk) break;
+
+        Fusb302MaskARegBits mask_a = {0};
+        mask_a.m_hardrst = 0;
+        mask_a.m_softrst = 0;
+        mask_a.m_txsent = 0;
+        mask_a.m_hardsent = 1;
+        mask_a.m_retryfail = 0;
+        mask_a.m_softfail = 1;
+        mask_a.m_togdone = 1;
+        mask_a.m_ocp_temp = 1;
+        res = fusb302_write_reg(instance, Fusb302RegMaskA, *(uint8_t*)&mask_a);
+        if(res != Fusb302StatusOk) break;
+
+        Fusb302MaskBRegBits mask_b = {0};
+        mask_b.m_gcrcsent = 0;
+        res = fusb302_write_reg(instance, Fusb302RegMaskB, *(uint8_t*)&mask_b);
+        if(res != Fusb302StatusOk) break;
+
+        // 6. Enable the INT pin; a sink applies no host pull-up current.
+        Fusb302Control0RegBits control0 = {0};
+        res = fusb302_read_reg(instance, Fusb302RegControl0, (uint8_t*)&control0);
+        if(res != Fusb302StatusOk) break;
+        control0.int_mask = 0;
+        control0.host_cur = 0;
+        res = fusb302_write_reg(instance, Fusb302RegControl0, *(uint8_t*)&control0);
+        if(res != Fusb302StatusOk) break;
+
+        // 7. Start from a clean PD state.
+        res = fusb302_pd_reset_logic(instance);
+        if(res != Fusb302StatusOk) break;
+        res = fusb302_pd_rx_flush(instance);
+        if(res != Fusb302StatusOk) break;
+        res = fusb302_pd_tx_flush(instance);
+        if(res != Fusb302StatusOk) break;
+
+        // 8. Drop any stale interrupts latched during configuration.
+        Fusb302Interrupts pending;
+        res = fusb302_read_interrupts(instance, &pending);
+    } while(false);
+
+    if(res != Fusb302StatusOk) {
+        FURI_LOG_E(TAG, "Failed to start PD sink!");
+    }
+    return res;
+}
+
+Fusb302Status fusb302_sink_arm(Fusb302* instance) {
+    furi_check(instance);
+    Fusb302Status res = Fusb302StatusUnknown;
+    do {
+        // Power the bandgap, receiver and measure block so VBUS can be sensed.
+        Fusb302PowerRegBits power = {0};
+        power.pwr = 0b0111;
+        res = fusb302_write_reg(instance, Fusb302RegPower, *(uint8_t*)&power);
+        if(res != Fusb302StatusOk) break;
+
+        // Present Rd on both CC lines (sink termination).
+        Fusb302Switches0RegBits sw0 = {0};
+        sw0.pdwn1 = 1;
+        sw0.pdwn2 = 1;
+        res = fusb302_write_reg(instance, Fusb302RegSwitches0, *(uint8_t*)&sw0);
+        if(res != Fusb302StatusOk) break;
+
+        // Only VBUSOK is of interest until a source attaches.
+        Fusb302MaskRegBits mask = {0};
+        mask.m_bc_lvl = 1;
+        mask.m_collision = 1;
+        mask.m_wake = 1;
+        mask.m_alert = 1;
+        mask.m_crc_chk = 1;
+        mask.m_comp_chng = 1;
+        mask.m_activity = 1;
+        mask.m_vbusok = 0;
+        res = fusb302_write_reg(instance, Fusb302RegMask, *(uint8_t*)&mask);
+        if(res != Fusb302StatusOk) break;
+
+        Fusb302MaskARegBits mask_a = {0};
+        mask_a.m_hardrst = 1;
+        mask_a.m_softrst = 1;
+        mask_a.m_txsent = 1;
+        mask_a.m_hardsent = 1;
+        mask_a.m_retryfail = 1;
+        mask_a.m_softfail = 1;
+        mask_a.m_togdone = 1;
+        mask_a.m_ocp_temp = 1;
+        res = fusb302_write_reg(instance, Fusb302RegMaskA, *(uint8_t*)&mask_a);
+        if(res != Fusb302StatusOk) break;
+
+        Fusb302MaskBRegBits mask_b = {0};
+        mask_b.m_gcrcsent = 1;
+        res = fusb302_write_reg(instance, Fusb302RegMaskB, *(uint8_t*)&mask_b);
+        if(res != Fusb302StatusOk) break;
+
+        // Enable the INT pin; a sink applies no host pull-up current.
+        Fusb302Control0RegBits control0 = {0};
+        res = fusb302_read_reg(instance, Fusb302RegControl0, (uint8_t*)&control0);
+        if(res != Fusb302StatusOk) break;
+        control0.int_mask = 0;
+        control0.host_cur = 0;
+        res = fusb302_write_reg(instance, Fusb302RegControl0, *(uint8_t*)&control0);
+        if(res != Fusb302StatusOk) break;
+
+        // Drop any stale interrupts.
+        Fusb302Interrupts pending;
+        res = fusb302_read_interrupts(instance, &pending);
+    } while(false);
+
+    if(res != Fusb302StatusOk) {
+        FURI_LOG_E(TAG, "Failed to arm sink!");
+    }
+    return res;
+}
+
+Fusb302Status fusb302_pd_disable(Fusb302* instance) {
+    furi_check(instance);
+    Fusb302Status res = Fusb302StatusUnknown;
+    do {
+        // Mask all interrupts at the INT pin.
+        Fusb302Control0RegBits control0 = {0};
+        res = fusb302_read_reg(instance, Fusb302RegControl0, (uint8_t*)&control0);
+        if(res != Fusb302StatusOk) break;
+        control0.int_mask = 1;
+        res = fusb302_write_reg(instance, Fusb302RegControl0, *(uint8_t*)&control0);
+        if(res != Fusb302StatusOk) break;
+
+        // Stop auto GoodCRC and disconnect the BMC transmitter from both CC lines.
+        Fusb302Switches1RegBits sw1 = {0};
+        res = fusb302_write_reg(instance, Fusb302RegSwitches1, *(uint8_t*)&sw1);
+        if(res != Fusb302StatusOk) break;
+
+        // Power down everything except the bandgap/wake circuit.
+        Fusb302PowerRegBits power = {0};
+        power.pwr = 0b0001;
+        res = fusb302_write_reg(instance, Fusb302RegPower, *(uint8_t*)&power);
+    } while(false);
+
+    if(res != Fusb302StatusOk) {
+        FURI_LOG_E(TAG, "Failed to disable PD!");
+    }
+    return res;
+}
+
 //////////////////////PD//////////////////////
 /**
  * @brief Resets the USB Power Delivery logic of the FUSB302.
@@ -629,7 +932,7 @@ Fusb302Status fusb302_pd_message_receive(Fusb302* instance, Fusb302PdMsg* msg) {
     Fusb302Status res = Fusb302StatusUnknown;
     Fusb302Status1RegBits status1_bits = {0};
     do {
-        res = fusb302_read_reg(instance, Fusb302RegControl0, (uint8_t*)&status1_bits);
+        res = fusb302_read_reg(instance, Fusb302RegStatus1, (uint8_t*)&status1_bits);
         if(res != Fusb302StatusOk) {
             break;
         }
