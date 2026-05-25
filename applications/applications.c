@@ -32,6 +32,7 @@ extern int32_t self_check_app(void* p);
 extern void power_cli(Cli* cli, FuriString* args, void* context);
 extern void power_consumption_cli(Cli* cli, FuriString* args, void* context);
 extern void led_cli(Cli* cli, FuriString* args, void* context);
+extern void pd_cli(Cli* cli, FuriString* args, void* context);
 
 const FlipperInternalApplication FLIPPER_SERVICES[] = {
     {
@@ -220,6 +221,11 @@ const FlipperInternalCommandApplication FLIPPER_CLI_COMMANDS[] = {
     {
         .callback = led_cli,
         .name = "led",
+        .flags = CliCommandFlagParallelSafe,
+    },
+    {
+        .callback = pd_cli,
+        .name = "pd",
         .flags = CliCommandFlagParallelSafe,
     },
 };

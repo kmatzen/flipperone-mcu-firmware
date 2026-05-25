@@ -1,0 +1,37 @@
+# Host tests
+
+Host-compilable unit tests for hardware-independent firmware logic. These run on
+the development machine (no target hardware required).
+
+## USB-PD protocol (`pd_protocol_test.c`)
+
+Covers the spec-critical bit packing/unpacking in
+`applications/services/pd/pd_protocol.c`: message-header build/parse, Source PDO
+decoding (Fixed / Battery / Variable / PPS), Request Data Object building, and
+Fixed-PDO selection. Expected values are hand-derived from the USB Power Delivery
+Specification.
+
+```sh
+cc -Wall -Wextra -I../applications/services/pd \
+   pd_protocol_test.c ../applications/services/pd/pd_protocol.c -o pd_protocol_test
+./pd_protocol_test
+```
+
+Expected output: `All PD protocol tests passed.`
+
+## USB-PD sink policy (`pd_sink_policy_test.c`)
+
+Simulates the sink negotiation state machine in
+`applications/services/pd/pd_sink_policy.c` end-to-end with no hardware: a full
+`Source_Capabilities` → `Request` → `Accept` → `PS_RDY` handshake, plus
+soft-reset, capability-mismatch fallback, Reject/Wait, detach, hard reset, and
+out-of-order message handling.
+
+```sh
+cc -Wall -Wextra -I../applications/services/pd pd_sink_policy_test.c \
+   ../applications/services/pd/pd_sink_policy.c \
+   ../applications/services/pd/pd_protocol.c -o pd_sink_policy_test
+./pd_sink_policy_test
+```
+
+Expected output: `All PD sink policy tests passed.`
