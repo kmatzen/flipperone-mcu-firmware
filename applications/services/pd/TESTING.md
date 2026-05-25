@@ -73,34 +73,40 @@ setting are confirmed to tolerate it. Default ceiling is
 
 ---
 
-## 3. DIY bring-up rig (no Flipper One board)
+## 3. DIY bring-up rig (RP2350, no Flipper One board)
 
-You can prototype the FUSB302 driver + PD negotiation on a breakout, but note:
-
-> **This firmware targets the RP2350** (Cortex-M33, Armv8-M, TrustZone; the build
-> is `cortex-m33 -mcmse`, FreeRTOS `RP2350_ARM_NTZ`). **It will not run on an
-> RP2040** (Cortex-M0+, Armv6-M) — different architecture.
+This firmware targets the **RP2350** (Cortex-M33, Armv8-M; the build is
+`cortex-m33 -mcmse`, FreeRTOS `RP2350_ARM_NTZ`, and the real board uses a
+PGA2350 / RP2350B module). A DIY test rig should therefore also be **RP2350-based**
+so the toolchain, `pico-sdk` and furi HAL all match — no architecture port needed.
+(An RP2040 is a different architecture — Cortex-M0+, Armv6-M — and is not the
+target; the f100 image will not run on it.)
 
 **Recommended rig:** a **Raspberry Pi Pico 2 (RP2350)** + a FUSB302 breakout.
-RP2350 matches the target MCU family, so the SDK/HAL line up.
 
-- **RP2040 (original Pico):** only viable if you port *just* the driver. The two
-  pure modules (`pd_sink_policy.c`, `pd_protocol.c`) are hardware-free and drop in
-  anywhere; only `fusb302.c`'s I/O (which calls `furi_hal_i2c`/`furi_hal_gpio`)
-  needs re-pointing at raw `pico-sdk` `hardware/i2c` + `hardware/gpio`. You would
-  not run the full f100 firmware.
+Because the MCU family matches the target:
+- The same build flow applies (`PICO_SDK_PATH`, `arm-none-eabi-gcc`,
+  `cmake -G Ninja`, build type `Release`).
+- The FUSB302 driver and both pure PD modules (`pd_protocol.c`,
+  `pd_sink_policy.c`) compile and run as-is — you adapt **board config + wiring**,
+  not code architecture.
+- You will need to disable/stub the peripherals the f100 board has but a bare
+  Pico 2 does not (display, I/O expander, charger, fuel gauge) to boot a minimal
+  image, or build a small standalone harness that just starts the `pd` service on
+  the FUSB302.
 
 **Wiring (any free I²C + one GPIO):**
 - FUSB302 `SDA`/`SCL` → an I²C bus (7-bit address **0x22**, see `FUSB302_ADDRESS`).
 - FUSB302 `INT_N` → a GPIO. On a DIY board wire it **directly** and pass that pin
   as `fusb302_init(..., pin_interrupt)` (the service passes `NULL` because the
-  real board uses the expander). The driver already supports a direct INT pin.
+  real board routes INT through the PCAL6416 I/O expander). The driver already
+  supports a direct INT pin.
 - FUSB302 `CC1`/`CC2` → the USB-C receptacle CC pins; `VBUS` to the receptacle
   VBUS (the FUSB302 senses VBUS internally — no extra divider needed).
 
 **Limitations of a DIY rig:**
-- No BQ25792, so you can't observe "charger actually charged" the same way. Read
-  the negotiated state via the FUSB302's own VBUS sense / the contract, and use an
+- No BQ25792, so you can't reproduce the full charge loop. Read the negotiated
+  state via the FUSB302's own VBUS sense / the reported contract, and use an
   inline USB-PD analyzer to confirm the real voltage on VBUS.
 - You still need a multi-PDO PD charger and a full-featured (CC-passthrough) C-to-C
   cable.
