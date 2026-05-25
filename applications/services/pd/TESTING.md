@@ -79,8 +79,6 @@ This firmware targets the **RP2350** (Cortex-M33, Armv8-M; the build is
 `cortex-m33 -mcmse`, FreeRTOS `RP2350_ARM_NTZ`, and the real board uses a
 PGA2350 / RP2350B module). A DIY test rig should therefore also be **RP2350-based**
 so the toolchain, `pico-sdk` and furi HAL all match — no architecture port needed.
-(An RP2040 is a different architecture — Cortex-M0+, Armv6-M — and is not the
-target; the f100 image will not run on it.)
 
 **Recommended rig:** a **Raspberry Pi Pico 2 (RP2350)** + a FUSB302 breakout.
 
